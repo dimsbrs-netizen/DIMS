@@ -1,0 +1,143 @@
+
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 28px 18px;
+  background: #f3f6fb;
+  font-family: 'DM Sans', 'Segoe UI', sans-serif;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 420px;
+  padding: 38px 36px 28px;
+  background: #fff;
+  border: 1px solid #e5ebf3;
+  border-radius: 14px;
+  box-shadow: 0 16px 50px rgb(20 38 65 / 8%);
+}
+
+.login-brand-mark {
+  width: 48px;
+  height: 48px;
+  margin: 0 auto 12px;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  background: #142641;
+  color: white;
+  font-size: 26px;
+  font-weight: 800;
+}
+
+.login-brand-name {
+  color: #142641;
+  text-align: center;
+  font-size: 24px;
+  font-weight: 800;
+  letter-spacing: 2px;
+}
+
+.login-brand-subtitle {
+  margin-top: 6px;
+  color: #7b889a;
+  text-align: center;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .8px;
+}
+
+.login-divider {
+  height: 1px;
+  margin: 28px 0;
+  background: #e9eef5;
+}
+
+.login-card h1 {
+  margin-bottom: 8px;
+  color: #1c2a3e;
+  text-align: center;
+  font-size: 24px;
+}
+
+.login-description {
+  margin-bottom: 26px;
+  color: #8490a0;
+  text-align: center;
+  font-size: 12px;
+}
+
+.login-card form {
+  display: flex;
+  flex-direction: column;
+}
+
+.login-card label {
+  margin: 0 0 8px;
+  color: #344258;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.login-card input {
+  width: 100%;
+  margin-bottom: 19px;
+  padding: 12px 13px;
+  color: #26354a;
+  background: #fff;
+  border: 1px solid #dfe6ef;
+  border-radius: 7px;
+  outline: none;
+  font-size: 12px;
+}
+
+.login-card input:focus {
+  border-color: #557db5;
+  box-shadow: 0 0 0 3px rgb(85 125 181 / 12%);
+}
+
+.login-card form button {
+  margin-top: 4px;
+  padding: 13px;
+  color: white;
+  background: #142641;
+  border: none;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.login-card form button:hover {
+  background: #203b60;
+}
+
+.login-card form button:disabled {
+  cursor: wait;
+  opacity: .7;
+}
+
+.login-error {
+  margin: 0 0 15px;
+  padding: 11px;
+  color: #a12e2e;
+  background: #fff1f0;
+  border: 1px solid #f2d3d0;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.login-security-note {
+  margin-top: 25px;
+  color: #8a96a6;
+  text-align: center;
+  font-size: 10px;
+}
+
+@media (max-width: 480px) {
+  .login-card {
+    padding: 30px 22px 24px;
+  }
+}

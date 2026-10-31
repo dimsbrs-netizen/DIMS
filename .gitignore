@@ -1,0 +1,19 @@
+﻿.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite3
+*.log
+.pytest_cache/
+# Frontend dependencies and build files
+node_modules/
+dist/
+# Downloaded archives and old project backups
+*.zip
+backup*/
+backup-before-*/
+investigation-update-preview/
+ai-agent-update-preview/
