@@ -17,3 +17,8 @@ backup*/
 backup-before-*/
 investigation-update-preview/
 ai-agent-update-preview/
+
+# Local backup files
+*_before_*.py
+
+backend/*_before_*.py
