@@ -13,7 +13,11 @@ class User(Base):
     hashed_password = Column(String(255), nullable=False)
     role = Column(String(50), nullable=False, default="operative")
     department_id = Column(Integer, ForeignKey("departments.id"), nullable=True)
+    full_name = Column(String(150), nullable=True)
+    designation = Column(String(150), nullable=True)
+    formation = Column(String(255), nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
+    must_change_password = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
@@ -69,6 +73,10 @@ class IntelligenceReport(Base):
     reporting_officer_id = Column(
         Integer, ForeignKey("users.id"), nullable=False
     )
+    submitted_by_username = Column(String(100), nullable=True)
+    submitter_full_name = Column(String(150), nullable=True)
+    submitter_designation = Column(String(150), nullable=True)
+    submitter_formation = Column(String(255), nullable=True)
     department_id = Column(
         Integer, ForeignKey("departments.id"), nullable=True
     )
@@ -287,3 +295,45 @@ class LearningReference(Base):
         server_default=func.now(),
         nullable=False,
     )
+
+
+class ReportWorkflow(Base):
+    __tablename__ = "report_workflows"
+    id = Column(Integer, primary_key=True, index=True)
+    report_id = Column(Integer, ForeignKey("intelligence_reports.id"), unique=True, nullable=False, index=True)
+    current_assignee_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    current_stage = Column(String(50), nullable=False, default="department")
+    workflow_status = Column(String(50), nullable=False, default="in_review")
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class ReportForwardHistory(Base):
+    __tablename__ = "report_forward_history"
+    id = Column(Integer, primary_key=True, index=True)
+    report_id = Column(Integer, ForeignKey("intelligence_reports.id"), nullable=False, index=True)
+    sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    recipient_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    note = Column(String(1000), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    report_id = Column(Integer, ForeignKey("intelligence_reports.id"), nullable=True, index=True)
+    title = Column(String(255), nullable=False)
+    message = Column(String(1000), nullable=False)
+    is_read = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ProcessedReportEditHistory(Base):
+    __tablename__ = "processed_report_edit_history"
+    id = Column(Integer, primary_key=True, index=True)
+    processed_report_id = Column(Integer, ForeignKey("processed_reports.id"), nullable=False, index=True)
+    edited_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    previous_heading = Column(String(500), nullable=True)
+    previous_body = Column(String, nullable=True)
+    previous_comment = Column(String, nullable=True)
+    edited_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

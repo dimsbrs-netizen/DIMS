@@ -22,3 +22,9 @@ ai-agent-update-preview/
 *_before_*.py
 
 backend/*_before_*.py
+
+# DIMS backup folders
+DIMS_BACKUP*/
+DIMS_*BACKUP*/
+backup*/
+backup-before-*/

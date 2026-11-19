@@ -20,9 +20,19 @@ export const authApi = {
     localStorage.setItem('dims_token', data.access_token)
     localStorage.setItem('dims_user', JSON.stringify({
       user_id: data.user_id, username: data.username, role: data.role,
-      token_type: data.token_type,
+      full_name: data.full_name, designation: data.designation, formation: data.formation,
+      token_type: data.token_type, must_change_password: Boolean(data.must_change_password),
     }))
     return data
+  },
+  async changePassword(current_password, new_password) {
+    const result = await request('/auth/change-password', {
+      method: 'POST',
+      body: JSON.stringify({ current_password, new_password }),
+    })
+    const storedUser = JSON.parse(localStorage.getItem('dims_user') || '{}')
+    localStorage.setItem('dims_user', JSON.stringify({ ...storedUser, must_change_password: false }))
+    return result
   },
   logout() {
     localStorage.removeItem('dims_token')
@@ -75,4 +85,28 @@ export const administrationApi = {
   assignAnalystDepartment: (userId, departmentId) => request(`/users/${userId}/department`, {
     method: 'PATCH', body: JSON.stringify({ department_id: departmentId }),
   }),
+}
+
+export const adminDashboardApi = {
+  summary: () => request('/admin/summary'),
+  users: () => request('/users'),
+  createUser: (data) => request('/admin/users', { method: 'POST', body: JSON.stringify(data) }),
+  updateUser: (id, data) => request(`/admin/users/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  resetPassword: (id, temporary_password) => request(`/admin/users/${id}/reset-password`, { method: 'POST', body: JSON.stringify({ temporary_password }) }),
+  updateRole: (id, role) => request(`/users/${id}/role`, { method: 'PATCH', body: JSON.stringify({ role }) }),
+  updateStatus: (id, is_active) => request(`/users/${id}/status`, { method: 'PATCH', body: JSON.stringify({ is_active }) }),
+  departments: () => request('/departments'),
+  createDepartment: (data) => request('/departments', { method: 'POST', body: JSON.stringify(data) }),
+  auditLogs: () => request('/audit-logs?limit=100'),
+}
+
+export const reviewWorkflowApi = {
+  pending: () => request('/workflow/pending'),
+  reviewed: () => request('/workflow/reviewed'),
+  reviewers: () => request('/workflow/reviewers'),
+  forward: (reportId, data) => request(`/reports/${reportId}/forward`, { method: 'POST', body: JSON.stringify(data) }),
+  workflow: (reportId) => request(`/reports/${reportId}/workflow`),
+  notifications: () => request('/notifications'),
+  markRead: (id) => request(`/notifications/${id}/read`, { method: 'PATCH' }),
+  discard: (reportId, reason) => request(`/reports/${reportId}/discard`, { method: 'POST', body: JSON.stringify({ reason }) }),
 }

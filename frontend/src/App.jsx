@@ -1,9 +1,12 @@
 
 import { useEffect, useState } from 'react'
 import './App.css'
-import { authApi, casesApi, investigationsApi, aiApi, learningReferencesApi } from './api'
+import { authApi, casesApi, investigationsApi, aiApi, learningReferencesApi, intelligenceReportsApi } from './api'
 import Login from './Login'
 import ReportsWorkspace from './ReportsWorkspace'
+import AdminDashboard from './AdminDashboard'
+import AuditLogs from './AuditLogs'
+import DepartmentTaskings from './DepartmentTaskings'
 
 const navigation = [
   {
@@ -13,15 +16,14 @@ const navigation = [
       { label: 'Investigation Management', icon: '▧' },
       { label: 'Intelligence Processing Agent', icon: '✦' },
       { label: 'Intelligence Reports', icon: '◈' },
-      { label: 'Tasking & Operations', icon: '⇄' },
       { label: 'Learning References', icon: '📚' },
     ]
   },
   {
     section: 'MANAGEMENT', items: [
       { label: 'Departments', icon: '▥' },
-      { label: 'Users & Access', icon: '♙' },
       { label: 'Audit Logs', icon: '◷' },
+      { label: 'Admin Dashboard', icon: '⚙' },
     ]
   },
 ]
@@ -32,7 +34,8 @@ function App() {
 
   const [user, setUser] = useState(() => {
     try {
-      return JSON.parse(localStorage.getItem('dims_user') || 'null')
+      const savedUser = JSON.parse(localStorage.getItem('dims_user') || 'null')
+      return savedUser?.must_change_password ? null : savedUser
     } catch {
       return null
     }
@@ -47,6 +50,9 @@ function App() {
   const [cases, setCases] = useState([])
   const [casesLoading, setCasesLoading] = useState(false)
   const [casesError, setCasesError] = useState('')
+  const [reportDashboard, setReportDashboard] = useState({ reports: [], activeTaskings: [] })
+  const [reportDashboardLoading, setReportDashboardLoading] = useState(false)
+  const [reportDashboardError, setReportDashboardError] = useState('')
   const [investigations, setInvestigations] = useState([])
   const [investigationsLoading, setInvestigationsLoading] = useState(false)
   const [investigationsError, setInvestigationsError] = useState('')
@@ -60,7 +66,6 @@ function App() {
   const [investigationSections, setInvestigationSections] = useState({})
   const [selectedInvestigation, setSelectedInvestigation] = useState(null)
   const [aiRawText, setAiRawText] = useState('')
-  const [aiCaseId, setAiCaseId] = useState('')
   const [aiBusy, setAiBusy] = useState(false)
   const [aiError, setAiError] = useState('')
   const [aiResult, setAiResult] = useState(null)
@@ -83,7 +88,6 @@ function App() {
     try {
       const result = await aiApi.processReport({
         raw_text: aiRawText.trim(),
-        case_id: aiCaseId ? Number(aiCaseId) : null,
       })
       setAiResult(result)
     } catch (error) {
@@ -117,6 +121,26 @@ function App() {
       setInvestigationsError(error.message || 'Unable to load investigations.')
     } finally {
       setInvestigationsLoading(false)
+    }
+  }
+
+  async function loadReportDashboard() {
+    if (String(user?.role || '').toLowerCase() !== 'management') return
+    setReportDashboardLoading(true)
+    setReportDashboardError('')
+    try {
+      const [reportData, taskingData] = await Promise.all([
+        intelligenceReportsApi.list(),
+        intelligenceReportsApi.activeTaskings(),
+      ])
+      setReportDashboard({
+        reports: Array.isArray(reportData.reports) ? reportData.reports : [],
+        activeTaskings: Array.isArray(taskingData.active_taskings) ? taskingData.active_taskings : [],
+      })
+    } catch (error) {
+      setReportDashboardError(error.message || 'Unable to load the Management report overview.')
+    } finally {
+      setReportDashboardLoading(false)
     }
   }
 
@@ -171,15 +195,15 @@ function App() {
   }
 
   const investigationFields = [
-    ['introduction', '1. INTRODUCTION'],
-    ['facts_of_case', '2. FACTS OF THE CASE'],
-    ['objective_of_investigation', '3. OBJECTIVE OF THE INVESTIGATION'],
-    ['investigation_activities', '4. INVESTIGATION ACTIVITIES'],
-    ['background_check', '5. BACKGROUND CHECK'],
-    ['suspect_statements', '6. PROFILE/SUMMARY OF SUSPECT’S STATEMENTS'],
-    ['mobile_phone_exploitation', '7. MOBILE PHONE EXPLOITATION'],
-    ['findings', '8. FINDINGS'],
-    ['conclusion', '9. CONCLUSION'],
+    ['introduction', 'INTRODUCTION'],
+    ['facts_of_case', 'FACTS OF THE CASE'],
+    ['objective_of_investigation', 'OBJECTIVE OF THE INVESTIGATION'],
+    ['investigation_activities', 'INVESTIGATION ACTIVITIES'],
+    ['background_check', 'BACKGROUND CHECK'],
+    ['suspect_statements', 'PROFILE/SUMMARY OF SUSPECT’S STATEMENTS'],
+    ['mobile_phone_exploitation', 'MOBILE PHONE EXPLOITATION'],
+    ['findings', 'FINDINGS'],
+    ['conclusion', 'CONCLUSION'],
   ]
 
   async function handleCreateCase(event) {
@@ -215,6 +239,7 @@ function App() {
     if (user && localStorage.getItem('dims_token')) {
       loadCases()
       loadInvestigations()
+      loadReportDashboard()
     }
   }, [user])
 
@@ -242,11 +267,26 @@ function App() {
     'Investigation Management': 'Prepare structured investigation dossiers linked to registered cases.',
     'Intelligence Processing Agent': 'Use AI to structure synthetic raw reports and flag missing information for analyst review.',
     'Tasking & Operations': 'Coordinate task assignments and operational follow-up.',
-    Departments: 'View organizational departments and units.',
+    Departments: 'Review reports currently tasked to each department.',
     'Users & Access': 'Manage users and access roles.',
     'Audit Logs': 'Review recorded system activities and changes.',
     'Learning References': 'Save and manage approved examples for AI report processing.',
   }
+
+  const isManagementUser = String(user?.role || '').toLowerCase() === 'management'
+  const activeTaskedReportIds = new Set(reportDashboard.activeTaskings.map(item => Number(item.report_id)))
+  const getDashboardStatus = (item) => String(item.report_status || item.status || '').toLowerCase()
+  const needsManagementAttention = reportDashboard.reports.filter(item => {
+    const status = getDashboardStatus(item)
+    return status === 'processed' || (status === 'submitted' && !activeTaskedReportIds.has(Number(item.report_id)))
+  })
+  const waitingForDepartment = reportDashboard.reports.filter(item =>
+    getDashboardStatus(item) === 'submitted' && activeTaskedReportIds.has(Number(item.report_id))
+  )
+  const processedReports = reportDashboard.reports.filter(item => getDashboardStatus(item) === 'processed')
+  const completedReports = reportDashboard.reports.filter(item =>
+    ['approved', 'discarded'].includes(getDashboardStatus(item))
+  )
 
   return (
     <div className="app-shell">
@@ -265,21 +305,28 @@ function App() {
         </div>
 
         <nav className="navigation">
-          {navigation.map((group) => (
-            <div className="nav-group" key={group.section}>
-              <div className="nav-heading">{group.section}</div>
-              {group.items.map((item) => (
-                <button
-                  className={`nav-item ${activePage === item.label ? 'active' : ''}`}
-                  key={item.label}
-                  onClick={() => setActivePage(item.label)}
-                >
-                  <span className="nav-icon">{item.icon}</span>
-                  <span>{item.label}</span>
-                </button>
-              ))}
-            </div>
-          ))}
+          {navigation.map((group) => {
+            const visibleItems = group.items.filter(item => {
+              const role = String(user?.role || '').toLowerCase()
+              if (item.label === 'Admin Dashboard') return role === 'admin'
+              if (item.label === 'Departments') return role === 'management'
+              if (item.label === 'Audit Logs') return ['admin', 'management', 'supervisor'].includes(role)
+             return true
+          })
+            return visibleItems.length ? <div className="nav-group" key={group.section}>
+            <div className="nav-heading">{group.section}</div>
+            {visibleItems.map((item) => (
+              <button
+                className={`nav-item ${activePage === item.label ? 'active' : ''}`}
+                key={item.label}
+                onClick={() => setActivePage(item.label)}
+              >
+                <span className="nav-icon">{item.icon}</span>
+                <span>{item.label}</span>
+              </button>
+            ))}
+          </div> : null
+          })}
         </nav>
 
         <div className="sidebar-bottom">
@@ -324,7 +371,7 @@ function App() {
 
           {activePage === 'Dashboard' ? (
             <>
-              <section className="metrics-grid">
+              <section className="metrics-grid dashboard-metrics">
                 <article className="metric-card">
                   <div className="metric-top">
                     <span className="metric-label">TOTAL CASES</span>
@@ -334,34 +381,56 @@ function App() {
                     {casesLoading ? '…' : casesError ? '!' : cases.length}
                   </div>
                   <div className="metric-foot">
-                    {casesError ? 'Unable to retrieve cases' : 'Cases returned by DIMS'}
+                    {casesError ? 'Unable to retrieve cases' : 'Registered case records'}
                   </div>
                 </article>
-                <article className="metric-card">
-                  <div className="metric-top">
-                    <span className="metric-label">INTELLIGENCE REPORTS</span>
-                    <span className="metric-icon blue">◈</span>
-                  </div>
-                  <div className="metric-value">—</div>
-                  <div className="metric-foot">Not connected yet</div>
-                </article>
-                <article className="metric-card">
-                  <div className="metric-top">
-                    <span className="metric-label">PENDING TASKS</span>
-                    <span className="metric-icon amber">⇄</span>
-                  </div>
-                  <div className="metric-value">—</div>
-                  <div className="metric-foot">Not connected yet</div>
-                </article>
-                <article className="metric-card">
-                  <div className="metric-top">
-                    <span className="metric-label">REPORTS FOR REVIEW</span>
-                    <span className="metric-icon green">✓</span>
-                  </div>
-                  <div className="metric-value">—</div>
-                  <div className="metric-foot">Not connected yet</div>
-                </article>
+                {isManagementUser && <>
+                  <button type="button" className="metric-card metric-card-button" onClick={() => setActivePage('Intelligence Reports')}>
+                    <div className="metric-top"><span className="metric-label">REQUIRES ATTENTION</span><span className="metric-icon amber">!</span></div>
+                    <div className="metric-value">{reportDashboardLoading ? '…' : reportDashboardError ? '!' : needsManagementAttention.length}</div>
+                    <div className="metric-foot">Awaiting tasking or approval</div>
+                  </button>
+                  <button type="button" className="metric-card metric-card-button" onClick={() => setActivePage('Intelligence Reports')}>
+                    <div className="metric-top"><span className="metric-label">WAITING</span><span className="metric-icon blue">◷</span></div>
+                    <div className="metric-value">{reportDashboardLoading ? '…' : reportDashboardError ? '!' : waitingForDepartment.length}</div>
+                    <div className="metric-foot">Assigned to departments</div>
+                  </button>
+                  <button type="button" className="metric-card metric-card-button" onClick={() => setActivePage('Intelligence Reports')}>
+                    <div className="metric-top"><span className="metric-label">PROCESSED</span><span className="metric-icon navy">▤</span></div>
+                    <div className="metric-value">{reportDashboardLoading ? '…' : reportDashboardError ? '!' : processedReports.length}</div>
+                    <div className="metric-foot">Awaiting Management decision</div>
+                  </button>
+                  <button type="button" className="metric-card metric-card-button" onClick={() => setActivePage('Intelligence Reports')}>
+                    <div className="metric-top"><span className="metric-label">APPROVED / DISCARDED</span><span className="metric-icon green">✓</span></div>
+                    <div className="metric-value">{reportDashboardLoading ? '…' : reportDashboardError ? '!' : completedReports.length}</div>
+                    <div className="metric-foot">Completed reports</div>
+                  </button>
+                </>}
               </section>
+              {isManagementUser && <section className="panel management-attention-panel">
+                <div className="panel-heading">
+                  <div><h2>Management Attention</h2><p>Reports that need a Management decision.</p></div>
+                  <button className="secondary-button" onClick={loadReportDashboard} disabled={reportDashboardLoading}>{reportDashboardLoading ? 'Refreshing…' : 'Refresh reports'}</button>
+                </div>
+                {reportDashboardError ? <div className="cases-error"><strong>Report overview could not be loaded.</strong><p>{reportDashboardError}</p><button className="primary-button" onClick={loadReportDashboard}>Try again</button></div>
+                  : reportDashboardLoading ? <p className="cases-message">Loading report overview…</p>
+                    : needsManagementAttention.length === 0 ? <p className="cases-message">No reports currently require Management attention.</p>
+                      : <div className="management-attention-list">
+                        {needsManagementAttention.slice(0, 8).map(item => {
+                          const status = getDashboardStatus(item)
+                          const action = status === 'processed' ? 'APPROVAL REQUIRED' : 'TASKING REQUIRED'
+                          return <button type="button" className="management-attention-item" key={item.report_id} onClick={() => setActivePage('Intelligence Reports')}>
+                            <span className="attention-copy">
+                              <strong>{item.heading || item.title || 'UNTITLED REPORT'}</strong>
+                              <small>{item.report_reference || `Report ${item.report_id}`} · {item.location || 'Location not stated'}{item.lga ? `, ${item.lga}` : ''}</small>
+                            </span>
+                            <span className={`attention-action ${status === 'processed' ? 'approval' : 'tasking'}`}>{action}</span>
+                          </button>
+                        })}
+                      </div>}
+                {needsManagementAttention.length > 8 && <p className="management-more">Showing 8 of {needsManagementAttention.length} reports. Open Intelligence Reports to view the full register.</p>}
+                <div className="management-register-link"><button className="primary-button" onClick={() => setActivePage('Intelligence Reports')}>Open Intelligence Reports</button></div>
+              </section>}
 
               {casesError && (
                 <section className="panel cases-error">
@@ -385,8 +454,9 @@ function App() {
                     {[
                       ['Cases', '▤', 'Register and track intelligence cases'],
                       ['Intelligence Reports', '◈', 'Submit, process and review reports'],
-                      ['Tasking & Operations', '⇄', 'Coordinate task assignments'],
-                      ['Audit Logs', '◷', 'Review recorded system activity'],
+                      ...(['admin', 'management'].includes(String(user?.role || '').toLowerCase())
+                        ? [['Audit Logs', '◷', 'Review recorded system activity']]
+                        : []),
                     ].map(([label, icon, description]) => (
                       <button
                         key={label}
@@ -569,8 +639,6 @@ function App() {
               </div>
               <div className="ai-safety-notice"><strong>Prototype safety notice</strong><p>Use synthetic or declassified text only. The AI output is a draft, not verified intelligence. Check all claims against source material.</p></div>
               <form className="ai-processing-form" onSubmit={handleAIProcessing}>
-                <label htmlFor="ai-case">Optional linked case</label>
-                <select id="ai-case" value={aiCaseId} onChange={e => setAiCaseId(e.target.value)}><option value="">No case context</option>{cases.map(item => <option key={item.id} value={item.id}>{item.case_reference} — {item.title}</option>)}</select>
                 <label htmlFor="ai-raw-report">Synthetic raw report</label>
                 <textarea id="ai-raw-report" rows={10} minLength={20} maxLength={12000} required value={aiRawText} onChange={e => setAiRawText(e.target.value)} placeholder="Paste a synthetic raw report here. Include only facts you want the agent to process." />
                 <div className="ai-form-footer"><span>{aiRawText.length}/12000 characters</span><button className="primary-button" type="submit" disabled={aiBusy || aiRawText.trim().length < 20}>{aiBusy ? 'Processing with AI…' : 'Process Report'}</button></div>
@@ -698,8 +766,12 @@ function App() {
 
           ) : activePage === 'Intelligence Reports' ? (
             <ReportsWorkspace user={user} />
-          ) : activePage === 'Departments' || activePage === 'Users & Access' ? (
-            <ReportsWorkspace user={user} />
+          ) : activePage === 'Departments' && String(user?.role || '').toLowerCase() === 'management' ? (
+            <DepartmentTaskings />
+          ) : activePage === 'Audit Logs' && ['admin', 'management'].includes(String(user?.role || '').toLowerCase()) ? (
+            <AuditLogs />
+          ) : activePage === 'Admin Dashboard' && String(user?.role || '').toLowerCase() === 'admin' ? (
+            <AdminDashboard user={user} />
           ) : activePage === 'Learning References' ? (
             <section className="panel">
               <h2>Learning References</h2>

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -69,6 +69,46 @@ if "department_id" not in _user_columns:
             text("ALTER TABLE users ADD COLUMN department_id INTEGER REFERENCES departments(id)")
         )
 
+# Add forced password change support without changing existing account states.
+if "must_change_password" not in _user_columns:
+    with engine.begin() as _connection:
+        _connection.execute(
+            text("ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT 0")
+        )
+
+# Consolidate legacy duplicate processed rows into one shared record per report.
+# Older rows are preserved as edit-history snapshots before they are removed.
+with engine.begin() as _connection:
+    _duplicate_reports = _connection.execute(text(
+        "SELECT intelligence_report_id FROM processed_reports "
+        "GROUP BY intelligence_report_id HAVING COUNT(*) > 1"
+    )).fetchall()
+    for (_report_id,) in _duplicate_reports:
+        _rows = _connection.execute(text(
+            "SELECT id, heading, body, comment, processed_by, processed_at "
+            "FROM processed_reports WHERE intelligence_report_id = :rid "
+            "ORDER BY processed_at ASC, id ASC"
+        ), {"rid": _report_id}).mappings().all()
+        if len(_rows) < 2:
+            continue
+        _canonical_id = _rows[-1]["id"]
+        for _old in _rows[:-1]:
+            # Keep any edit history already attached to an older row.
+            _connection.execute(text(
+                "UPDATE processed_report_edit_history "
+                "SET processed_report_id = :canonical "
+                "WHERE processed_report_id = :old_id"
+            ), {"canonical": _canonical_id, "old_id": _old["id"]})
+            if _old["processed_by"] is not None:
+                _connection.execute(text(
+                    "INSERT INTO processed_report_edit_history "
+                    "(processed_report_id, edited_by, previous_heading, previous_body, previous_comment, edited_at) "
+                    "VALUES (:pid, :editor, :heading, :body, :comment, :edited_at)"
+                ), {"pid": _canonical_id, "editor": _old["processed_by"],
+                    "heading": _old["heading"], "body": _old["body"],
+                    "comment": _old["comment"], "edited_at": _old["processed_at"]})
+            _connection.execute(text("DELETE FROM processed_reports WHERE id = :old_id"), {"old_id": _old["id"]})
+
 
 # Registration request
 class UserCreate(BaseModel):
@@ -81,6 +121,8 @@ class ReportSubmission(BaseModel):
     raw_text: str = Field(min_length=10)
     title: str | None = Field(default=None, max_length=255)
     report_format_id: int | None = None
+    case_id: int | None = None
+    department_id: int | None = None
     incident_date: datetime | None = None
     incident_time: str | None = Field(default=None, max_length=20)
     location: str | None = Field(default=None, max_length=255)
@@ -120,44 +162,13 @@ def health_check():
 
 
 # User registration
-@app.post("/register", status_code=201)
-def register_user(
-    user: UserCreate,
-    db: Session = Depends(get_db)
-):
-    # Check whether the username already exists
-    existing_user = db.query(models.User).filter(
-        models.User.username == user.username
-    ).first()
+@app.post("/register", status_code=403)
+def register_user():
+    raise HTTPException(
+        status_code=403,
+        detail="Public registration is disabled. Contact the DIMS Administrator for an account."
+    )
 
-    if existing_user:
-        raise HTTPException(
-            status_code=409,
-            detail="Username already exists"
-        )
-
-    # Hash the password
-    hashed_password = password_hash.hash(user.password)
-
-    # Create the new user
-    new_user = models.User(
-    username=user.username,
-    hashed_password=hashed_password,
-    role="operative"
-)
-    
-
-    # Save the user
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
-
-    return {
-        "message": "User registered successfully",
-        "user_id": new_user.id,
-        "username": new_user.username,
-        "role": new_user.role
-    }
 # Login request
 class UserLogin(BaseModel):
     username: str
@@ -223,7 +234,11 @@ def login_user(user: UserLogin, db: Session = Depends(get_db)):
     "token_type": "bearer",
     "user_id": db_user.id,
     "username": db_user.username,
-    "role": db_user.role
+    "role": db_user.role,
+    "full_name": db_user.full_name,
+    "designation": db_user.designation,
+    "formation": db_user.formation,
+    "must_change_password": bool(getattr(db_user, "must_change_password", False))
 }
 
 
@@ -243,6 +258,7 @@ security = HTTPBearer()
 
 
 def get_current_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db)
 ):
@@ -277,6 +293,17 @@ def get_current_user(
         raise HTTPException(
             status_code=401,
             detail="User not found"
+        )
+
+    # Enforce account status centrally for every endpoint using authentication.
+    if not db_user.is_active:
+        raise HTTPException(status_code=403, detail="User account is inactive.")
+
+    # Temporary passwords permit access only to the password change endpoint.
+    if getattr(db_user, "must_change_password", False) and request.url.path.rstrip("/") != "/auth/change-password":
+        raise HTTPException(
+            status_code=403,
+            detail="Password change required. Sign in with your temporary password and change it to continue."
         )
 
     return db_user
@@ -414,6 +441,9 @@ def list_users(
             "user_id": user.id,
             "username": user.username,
             "role": user.role,
+            "full_name": user.full_name,
+            "designation": user.designation,
+            "formation": user.formation,
             "department_id": user.department_id,
             "department": (
                 db.query(models.Department).filter(models.Department.id == user.department_id).first().name
@@ -650,6 +680,29 @@ def submit_report(
                 detail="Report format not found or inactive"
             )
 
+    if submission.case_id is not None:
+        case = db.query(models.Case).filter(
+            models.Case.id == submission.case_id
+        ).first()
+
+        if not case:
+            raise HTTPException(
+                status_code=400,
+                detail="Case not found"
+            )
+
+    if submission.department_id is not None:
+        department = db.query(models.Department).filter(
+            models.Department.id == submission.department_id,
+            models.Department.is_active == True
+        ).first()
+
+        if not department:
+            raise HTTPException(
+                status_code=400,
+                detail="Department not found or inactive"
+            )
+
     # Generate a unique report reference.
     report_reference = f"DIMS-{datetime.now(timezone.utc):%Y%m%d}-{secrets.token_hex(4).upper()}"
 
@@ -657,9 +710,9 @@ def submit_report(
         report_reference=report_reference,
         title=submission.title,
         report_format_id=submission.report_format_id,
-        case_id=None,
+        case_id=submission.case_id,
         reporting_officer_id=current_user.id,
-        department_id=None,
+        department_id=submission.department_id,
         incident_date=submission.incident_date,
         incident_time=submission.incident_time,
         location=submission.location,
@@ -740,6 +793,25 @@ def can_access_report(
         )
         if department_assignment:
             return True
+
+    # A previous reviewer retains read-only access after forwarding the report.
+    previous_review = (
+        db.query(models.ReportForwardHistory)
+        .filter(
+            models.ReportForwardHistory.report_id == report.id,
+            models.ReportForwardHistory.sender_id == current_user.id,
+        )
+        .first()
+    )
+    if previous_review and current_user.is_active:
+        return True
+
+    # A report remains accessible to its currently assigned reviewer.
+    workflow_assignment = db.query(models.ReportWorkflow).filter_by(
+        report_id=report.id, current_assignee_id=current_user.id, workflow_status="in_review"
+    ).first()
+    if workflow_assignment and current_user.is_active:
+        return True
 
     # Other users need an explicit report-access grant.
     access_grant = (
@@ -1163,11 +1235,16 @@ def list_reports(
         else:
             department_report_ids = db.query(models.ReportTasking.report_id).filter(False)
 
+        workflow_report_ids = db.query(models.ReportWorkflow.report_id).filter(
+            models.ReportWorkflow.current_assignee_id == current_user.id,
+            models.ReportWorkflow.workflow_status == "in_review"
+        )
         reports = (
             query.filter(
                 (models.IntelligenceReport.reporting_officer_id == current_user.id)
                 | models.IntelligenceReport.id.in_(accessible_report_ids)
                 | models.IntelligenceReport.id.in_(department_report_ids)
+                | models.IntelligenceReport.id.in_(workflow_report_ids)
             ).all()
         )
 
@@ -1242,6 +1319,7 @@ def get_report(
             detail="Report not found"
         )
 
+    processed_report = db.query(models.ProcessedReport).filter_by(intelligence_report_id=report.id).order_by(models.ProcessedReport.id.desc()).first()
     raw_report = (
         db.query(models.RawReport)
         .filter(
@@ -1269,7 +1347,10 @@ def get_report(
         "lga": report.lga,
         "state": report.state,
         "created_at": report.created_at,
-        "raw_text": raw_report.raw_text if raw_report else None
+        "raw_text": raw_report.raw_text if raw_report else None,
+        "processed_heading": processed_report.heading if processed_report else None,
+        "processed_body": processed_report.body if processed_report else None,
+        "processed_comment": processed_report.comment if processed_report else None
     }
 
 
@@ -1317,17 +1398,29 @@ def process_report(
             raise HTTPException(status_code=403, detail="This report is not currently assigned to your department.")
 
 
-    processed = models.ProcessedReport(
-        intelligence_report_id=report.id,
-        heading=processing.heading,
-        body=processing.body,
-        comment=processing.comment,
-        processed_by=current_user.id
-    )
+    workflow = db.query(models.ReportWorkflow).filter_by(report_id=report.id).first()
+    if current_user.role == "analyst" and workflow and workflow.current_assignee_id != current_user.id:
+        raise HTTPException(status_code=403, detail="This report has been forwarded. The Analyst can no longer edit it.")
+    if current_user.role in {"management", "supervisor"}:
+        if not workflow or workflow.current_assignee_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Only the current assigned reviewer may edit this report.")
+    processed = db.query(models.ProcessedReport).filter_by(intelligence_report_id=report.id).order_by(models.ProcessedReport.id.desc()).first()
+    if processed is None:
+        processed = models.ProcessedReport(intelligence_report_id=report.id, processed_by=current_user.id)
+        db.add(processed)
+    else:
+        db.add(models.ProcessedReportEditHistory(
+            processed_report_id=processed.id, edited_by=current_user.id,
+            previous_heading=processed.heading, previous_body=processed.body,
+            previous_comment=processed.comment
+        ))
+    processed.heading = processing.heading
+    processed.body = processing.body
+    processed.comment = processing.comment
+    processed.processed_by = current_user.id
+    processed.processed_at = datetime.now(timezone.utc)
 
     try:
-        db.add(processed)
-
         # Update the report's current heading and workflow status.
         report.heading = processing.heading
         report.status = "processed"
@@ -1400,6 +1493,14 @@ def get_processing_history(
         .all()
     )
 
+    edit_history = (
+        db.query(models.ProcessedReportEditHistory)
+        .join(models.ProcessedReport, models.ProcessedReport.id == models.ProcessedReportEditHistory.processed_report_id)
+        .filter(models.ProcessedReport.intelligence_report_id == report_id)
+        .order_by(models.ProcessedReportEditHistory.edited_at.asc())
+        .all()
+    )
+
     processed_reports = (
         db.query(models.ProcessedReport)
         .filter(
@@ -1431,6 +1532,16 @@ def get_processing_history(
                 "processed_at": item.processed_at
             }
             for item in processed_reports
+        ],
+        "edit_history": [
+            {"edited_by": item.edited_by,
+             "edited_by_name": (db.query(models.User).filter(models.User.id == item.edited_by).first().full_name
+                                or db.query(models.User).filter(models.User.id == item.edited_by).first().username)
+                               if db.query(models.User).filter(models.User.id == item.edited_by).first() else "Unknown user",
+             "previous_heading": item.previous_heading,
+             "previous_body": item.previous_body, "previous_comment": item.previous_comment,
+             "edited_at": item.edited_at}
+            for item in edit_history
         ]
     }
 
@@ -1454,6 +1565,13 @@ def approve_report(
             detail="Report not found"
         )
 
+    designation = (current_user.designation or "").strip().lower()
+    if not ("state director" in designation or designation == "sds"):
+        raise HTTPException(status_code=403, detail="Only the State Director designation can approve reports in this release.")
+    workflow = db.query(models.ReportWorkflow).filter_by(report_id=report.id).first()
+    if not workflow or workflow.current_assignee_id != current_user.id:
+        raise HTTPException(status_code=403, detail="This report is not currently assigned to you for final approval.")
+
     if report.status == "approved":
         raise HTTPException(
             status_code=409,
@@ -1469,8 +1587,15 @@ def approve_report(
     try:
 
         report.status = "approved"
+        workflow.workflow_status = "approved"
         report.approved_by = current_user.id
         report.approved_at = datetime.now(timezone.utc)
+
+        # Approval closes the departmental work item while preserving its history.
+        db.query(models.ReportTasking).filter(
+            models.ReportTasking.report_id == report.id,
+            models.ReportTasking.is_active == True,
+        ).update({"is_active": False}, synchronize_session=False)
 
         record_audit(
             db=db,
@@ -1833,6 +1958,9 @@ def get_active_taskings(
             models.IntelligenceReport.id == tasking.report_id
         ).first()
 
+        if not report or report.status in {"approved", "discarded"}:
+            continue
+
         department = db.query(models.Department).filter(
             models.Department.id == tasking.department_id
         ).first()
@@ -1898,13 +2026,16 @@ def get_analyst_taskings(
             models.Department.id == tasking.department_id
         ).first()
 
-        if not report:
+        if not report or report.status in {"approved", "discarded"}:
             continue
 
         results.append({
             "report_id": report.id,
             "report_reference": report.report_reference,
-            "heading": report.heading,
+            "title": report.title,
+            "heading": report.heading or report.title,
+            "location": report.location,
+            "lga": report.lga,
             "unit": department.name if department else None,
             "instruction": tasking.instruction,
             "tasking_note": tasking.tasking_note,
@@ -1923,7 +2054,6 @@ def get_analyst_taskings(
 # ---------------------------------------------------------------------------
 class AIReportProcessingRequest(BaseModel):
     raw_text: str = Field(min_length=20, max_length=12000)
-    case_id: int | None = None
 
 
 @app.post("/ai/process-report")
@@ -1933,20 +2063,8 @@ def process_intelligence_with_ai(
     current_user: models.User = Depends(get_current_user),
 ):
     # Prototype safeguard: only synthetic/declassified material should be used.
-    case_context = ""
-    if payload.case_id is not None:
-        case = db.query(models.Case).filter(models.Case.id == payload.case_id).first()
-        if not case:
-            raise HTTPException(status_code=404, detail="Linked case was not found")
-        case_context = (
-            f"Case reference: {case.case_reference}\n"
-            f"Case title: {case.title}\n"
-            f"Case description: {case.description or '[Not provided]'}\n"
-            f"Case status: {case.status}"
-        )
-
     try:
-        result = process_raw_report(payload.raw_text, case_context)
+        result = process_raw_report(payload.raw_text, "")
     
     except Exception as exc:
         import traceback
@@ -1967,7 +2085,7 @@ def process_intelligence_with_ai(
 
     record_audit(
         db, current_user, "AI_REPORT_PROCESSED", "ai_processing", None,
-        f"Model={result['model']}; linked_case_id={payload.case_id}; "
+        f"Model={result['model']}; "
         f"input_tokens={result['usage']['input_tokens']}; output_tokens={result['usage']['output_tokens']}"
     )
     db.commit()
@@ -2264,3 +2382,268 @@ def get_manual_learning_references(
         }
         for reference in references
     ]
+
+# ---------------------------------------------------------------------------
+# DIMS administration and report review workflow extensions
+# ---------------------------------------------------------------------------
+class AdminUserCreate(BaseModel):
+    username: str = Field(min_length=3, max_length=100)
+    password: str = Field(min_length=8, max_length=128)
+    role: str = Field(default="operative")
+    full_name: str | None = Field(default=None, max_length=150)
+    designation: str | None = Field(default=None, max_length=150)
+    formation: str | None = Field(default=None, max_length=255)
+    department_id: int | None = None
+
+class AdminUserUpdate(BaseModel):
+    full_name: str | None = Field(default=None, max_length=150)
+    designation: str | None = Field(default=None, max_length=150)
+    formation: str | None = Field(default=None, max_length=255)
+    department_id: int | None = None
+
+class AdminPasswordReset(BaseModel):
+    temporary_password: str = Field(min_length=8, max_length=128)
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+class ReportForwardRequest(BaseModel):
+    recipient_id: int
+    note: str | None = Field(default=None, max_length=1000)
+
+class ReportDiscardRequest(BaseModel):
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+@app.post("/auth/change-password")
+def change_own_password(
+    payload: ChangePasswordRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not password_hash.verify(payload.current_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Current password is incorrect.")
+    if payload.current_password == payload.new_password:
+        raise HTTPException(status_code=400, detail="New password must be different from the temporary password.")
+    current_user.hashed_password = password_hash.hash(payload.new_password)
+    current_user.must_change_password = False
+    record_audit(
+        db,
+        current_user,
+        "USER_PASSWORD_CHANGED",
+        "user",
+        current_user.id,
+        "User changed their password."
+    )
+    db.commit()
+    return {"message": "Password changed successfully. You can now access DIMS."}
+
+
+def _user_payload(user, db):
+    dept = db.query(models.Department).filter(models.Department.id == user.department_id).first() if user.department_id else None
+    return {"user_id": user.id, "username": user.username, "role": user.role,
+            "full_name": user.full_name, "designation": user.designation,
+            "formation": user.formation, "department_id": user.department_id,
+            "department": dept.name if dept else None, "is_active": user.is_active,
+            "created_at": user.created_at}
+
+@app.post("/admin/users", status_code=201)
+def admin_create_user(payload: AdminUserCreate, current_user: models.User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    role = payload.role.strip().lower()
+    if role not in {"operative", "analyst", "supervisor", "management", "admin"}:
+        raise HTTPException(status_code=400, detail="Invalid system role.")
+    if db.query(models.User).filter(models.User.username == payload.username.strip()).first():
+        raise HTTPException(status_code=409, detail="Username already exists.")
+    if role == "analyst" and not payload.department_id:
+        raise HTTPException(status_code=400, detail="Analyst accounts must be assigned to a department.")
+    if payload.department_id and not db.query(models.Department).filter(models.Department.id == payload.department_id, models.Department.is_active == True).first():
+        raise HTTPException(status_code=400, detail="Selected department is unavailable.")
+    user = models.User(username=payload.username.strip(), hashed_password=password_hash.hash(payload.password), role=role,
+        full_name=(payload.full_name or "").strip() or None, designation=(payload.designation or "").strip() or None,
+        formation=(payload.formation or "").strip() or None, department_id=payload.department_id,
+        is_active=True, must_change_password=True)
+    db.add(user); db.flush()
+    record_audit(db, current_user, "USER_CREATED", "user", user.id, f"Created {role} account {user.username}")
+    db.commit(); db.refresh(user)
+    return _user_payload(user, db)
+
+@app.patch("/admin/users/{user_id}")
+def admin_update_user(user_id: int, payload: AdminUserUpdate, current_user: models.User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user: raise HTTPException(status_code=404, detail="User not found.")
+    if user_id == current_user.id and payload.department_id is not None:
+        raise HTTPException(status_code=403, detail="You cannot change your own administrative profile.")
+    if payload.department_id is not None:
+        if user.role != "analyst": raise HTTPException(status_code=400, detail="Department assignment is for Analyst accounts only.")
+        if not db.query(models.Department).filter(models.Department.id == payload.department_id, models.Department.is_active == True).first():
+            raise HTTPException(status_code=400, detail="Selected department is unavailable.")
+        user.department_id = payload.department_id
+    if payload.full_name is not None: user.full_name = payload.full_name.strip() or None
+    if payload.designation is not None: user.designation = payload.designation.strip() or None
+    if payload.formation is not None: user.formation = payload.formation.strip() or None
+    record_audit(db, current_user, "USER_PROFILE_UPDATED", "user", user.id, "Updated user profile details")
+    db.commit(); db.refresh(user)
+    return _user_payload(user, db)
+
+@app.post("/admin/users/{user_id}/reset-password")
+def admin_reset_user_password(
+    user_id: int,
+    payload: AdminPasswordReset,
+    current_user: models.User = Depends(require_role("admin")),
+    db: Session = Depends(get_db),
+):
+    target = db.query(models.User).filter(models.User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found.")
+    if target.id == current_user.id:
+        raise HTTPException(status_code=400, detail="Use the account recovery procedure for your own administrator account.")
+    target.hashed_password = password_hash.hash(payload.temporary_password)
+    target.must_change_password = True
+    record_audit(db, current_user, "USER_PASSWORD_RESET", "user", target.id,
+                 f"Administrator reset password for account {target.username}")
+    db.commit()
+    return {"message": f"Temporary password set for {target.username}. The account holder must change it at next sign-in. Communicate it directly and securely."}
+
+
+@app.get("/admin/summary")
+def admin_summary(current_user: models.User = Depends(require_role("admin")), db: Session = Depends(get_db)):
+    return {"users": db.query(models.User).count(), "active_users": db.query(models.User).filter(models.User.is_active == True).count(),
+            "departments": db.query(models.Department).filter(models.Department.is_active == True).count(),
+            "analysts_unassigned": db.query(models.User).filter(models.User.role == "analyst", models.User.department_id == None).count()}
+
+@app.get("/reports/{report_id}/workflow")
+def report_workflow(report_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    report = db.query(models.IntelligenceReport).filter(models.IntelligenceReport.id == report_id).first()
+    if not report or not can_access_report(report, current_user, db): raise HTTPException(status_code=404, detail="Report not found.")
+    wf = db.query(models.ReportWorkflow).filter_by(report_id=report_id).first()
+    history = db.query(models.ReportForwardHistory).filter_by(report_id=report_id).order_by(models.ReportForwardHistory.created_at.asc()).all()
+    def person(uid):
+        u = db.query(models.User).filter(models.User.id == uid).first()
+        return {"user_id": u.id, "username": u.username, "full_name": u.full_name, "designation": u.designation} if u else None
+    return {"current_assignee": person(wf.current_assignee_id) if wf and wf.current_assignee_id else None,
+            "current_stage": wf.current_stage if wf else "department", "workflow_status": wf.workflow_status if wf else report.status,
+            "history": [{"sender": person(h.sender_id), "recipient": person(h.recipient_id), "note": h.note, "created_at": h.created_at} for h in history]}
+
+@app.get("/workflow/pending")
+def workflow_pending(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not current_user.is_active: raise HTTPException(status_code=403, detail="Inactive account.")
+    rows = db.query(models.ReportWorkflow).filter(models.ReportWorkflow.current_assignee_id == current_user.id, models.ReportWorkflow.workflow_status == "in_review").all()
+    result = []
+    for wf in rows:
+        report = db.query(models.IntelligenceReport).filter(models.IntelligenceReport.id == wf.report_id).first()
+        if report:
+            result.append({"report_id": report.id, "report_reference": report.report_reference, "heading": report.heading or report.title, "status": report.status, "location": report.location, "lga": report.lga, "current_stage": wf.current_stage})
+    return {"pending_reports": result, "count": len(result)}
+
+@app.post("/reports/{report_id}/forward")
+def forward_report(report_id: int, payload: ReportForwardRequest, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    report = db.query(models.IntelligenceReport).filter_by(id=report_id).first()
+    if not report or not can_access_report(report, current_user, db): raise HTTPException(status_code=404, detail="Report not found.")
+    if report.status in {"approved", "discarded"}: raise HTTPException(status_code=409, detail="This report is closed.")
+    processed = db.query(models.ProcessedReport).filter_by(intelligence_report_id=report_id).order_by(models.ProcessedReport.id.desc()).first()
+    if not processed: raise HTTPException(status_code=400, detail="Save the processed report before forwarding.")
+    recipient = db.query(models.User).filter_by(id=payload.recipient_id, is_active=True).first()
+    if not recipient or recipient.role not in {"management", "supervisor"}: raise HTTPException(status_code=400, detail="Recipient must be an active Supervisor or Management account.")
+    def rank(u):
+        d = (u.designation or "").lower()
+        if "state director" in d or d.strip() == "sds": return 4
+        if "deputy director" in d or d.strip() == "dd": return 3
+        if "assistant director" in d or d.strip() == "ad": return 2
+        if "supervisor" in d: return 1
+        return 0
+    wf = db.query(models.ReportWorkflow).filter_by(report_id=report_id).first()
+    if current_user.role == "analyst":
+        if wf and wf.current_assignee_id != current_user.id:
+            raise HTTPException(status_code=403, detail="This report has already been forwarded for management review.")
+        if not db.query(models.ReportTasking).filter_by(report_id=report_id, department_id=current_user.department_id, is_active=True).first():
+            raise HTTPException(status_code=403, detail="Your department is not assigned to this report.")
+        sender_rank = 0
+    elif current_user.role in {"management", "supervisor"}:
+        if not wf or wf.current_assignee_id != current_user.id: raise HTTPException(status_code=403, detail="Only the current reviewer may forward this report.")
+        sender_rank = rank(current_user)
+    else: raise HTTPException(status_code=403, detail="This account cannot forward reports.")
+    recipient_rank = rank(recipient)
+    if recipient_rank <= sender_rank: raise HTTPException(status_code=400, detail="Reports can only be forwarded to a higher management designation.")
+    if recipient_rank == 0: raise HTTPException(status_code=400, detail="Recipient designation is not configured as a review level.")
+    if not wf:
+        wf = models.ReportWorkflow(report_id=report_id, current_assignee_id=recipient.id, current_stage=recipient.designation or "Management", workflow_status="in_review")
+        db.add(wf)
+    else:
+        wf.current_assignee_id = recipient.id; wf.current_stage = recipient.designation or "Management"
+    db.add(models.ReportForwardHistory(report_id=report_id, sender_id=current_user.id, recipient_id=recipient.id, note=payload.note))
+    db.add(models.Notification(user_id=recipient.id, report_id=report_id, title="Report forwarded for review", message=f"{report.report_reference} has been forwarded to you."))
+    record_audit(db, current_user, "REPORT_FORWARDED", "intelligence_report", report_id, f"Forwarded to user ID {recipient.id}")
+    db.commit()
+    return {"message": "Report forwarded successfully.", "recipient": recipient.username, "designation": recipient.designation}
+
+@app.get("/workflow/reviewed")
+def workflow_reviewed(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not current_user.is_active or current_user.role not in {"supervisor", "management"}:
+        raise HTTPException(status_code=403, detail="Only reviewing officers can view previously reviewed reports.")
+    rows = (
+        db.query(models.ReportForwardHistory.report_id)
+        .filter(models.ReportForwardHistory.sender_id == current_user.id)
+        .distinct()
+        .all()
+    )
+    reviewed = []
+    for (report_id,) in rows:
+        report = db.query(models.IntelligenceReport).filter_by(id=report_id).first()
+        workflow = db.query(models.ReportWorkflow).filter_by(report_id=report_id).first()
+        if not report or not can_access_report(report, current_user, db):
+            continue
+        assignee = db.query(models.User).filter_by(id=workflow.current_assignee_id).first() if workflow and workflow.current_assignee_id else None
+        reviewed.append({
+            "report_id": report.id,
+            "report_reference": report.report_reference,
+            "heading": report.heading or report.title,
+            "status": report.status,
+            "location": report.location,
+            "lga": report.lga,
+            "current_stage": workflow.current_stage if workflow else report.status,
+            "current_assignee": (assignee.full_name or assignee.username) if assignee else None,
+            "workflow_status": workflow.workflow_status if workflow else report.status,
+        })
+    reviewed.sort(key=lambda item: item["report_reference"], reverse=True)
+    return {"reviewed_reports": reviewed, "count": len(reviewed)}
+
+
+@app.get("/notifications")
+def list_notifications(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    items = db.query(models.Notification).filter_by(user_id=current_user.id).order_by(models.Notification.created_at.desc()).limit(100).all()
+    return {"notifications": [{"id": n.id, "report_id": n.report_id, "title": n.title, "message": n.message, "is_read": n.is_read, "created_at": n.created_at} for n in items], "unread_count": sum(1 for n in items if not n.is_read)}
+
+@app.patch("/notifications/{notification_id}/read")
+def mark_notification_read(notification_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    item = db.query(models.Notification).filter_by(id=notification_id, user_id=current_user.id).first()
+    if not item: raise HTTPException(status_code=404, detail="Notification not found.")
+    item.is_read = True; db.commit(); return {"message": "Notification marked as read."}
+
+@app.post("/reports/{report_id}/discard")
+def discard_report(report_id: int, payload: ReportDiscardRequest, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    report = db.query(models.IntelligenceReport).filter_by(id=report_id).first()
+    if not report: raise HTTPException(status_code=404, detail="Report not found.")
+    d = (current_user.designation or "").lower()
+    if current_user.role != "management" or not ("state director" in d or d.strip() == "sds"):
+        raise HTTPException(status_code=403, detail="Only the State Director designation can discard reports in this release.")
+    wf = db.query(models.ReportWorkflow).filter_by(report_id=report_id).first()
+    if not wf or wf.current_assignee_id != current_user.id: raise HTTPException(status_code=403, detail="This report is not currently assigned to you.")
+    report.status = "discarded"; wf.workflow_status = "discarded"
+    db.query(models.ReportTasking).filter_by(report_id=report.id, is_active=True).update({"is_active": False}, synchronize_session=False)
+    record_audit(db, current_user, "REPORT_DISCARDED", "intelligence_report", report_id, payload.reason)
+    db.commit(); return {"message": "Report discarded.", "status": report.status}
+
+@app.get("/workflow/reviewers")
+def workflow_reviewers(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if current_user.role not in {"analyst", "management", "supervisor"}: raise HTTPException(status_code=403, detail="Not authorised.")
+    users = db.query(models.User).filter(models.User.role.in_(["management", "supervisor"]), models.User.is_active == True).all()
+    def rank(u):
+        d=(u.designation or "").lower()
+        if "state director" in d or d.strip()=="sds": return 4
+        if "deputy director" in d or d.strip()=="dd": return 3
+        if "assistant director" in d or d.strip()=="ad": return 2
+        if "supervisor" in d: return 1
+        return 0
+    own=0 if current_user.role=="analyst" else rank(current_user)
+    return [{"user_id":u.id,"username":u.username,"full_name":u.full_name,"designation":u.designation,"formation":u.formation} for u in users if rank(u)>own]
