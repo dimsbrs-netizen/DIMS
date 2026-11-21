@@ -11,10 +11,9 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import jwt
 
-from .database import engine, Base, get_db
-from . import models
-from .ai_service import process_raw_report
-
+from database import engine, Base, get_db
+import models
+from ai_service import process_raw_report
 
 def record_audit(
     db: Session,

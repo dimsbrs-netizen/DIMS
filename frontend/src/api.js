@@ -1,4 +1,4 @@
-const API_BASE = 'https://dims-5fam.onrender.com'
+const API_BASE = import.meta.env.VITE_API_URL || '/api'
 async function request(path, options = {}) {
   const token = localStorage.getItem('dims_token')
   const headers = { 'Content-Type': 'application/json', ...options.headers }
