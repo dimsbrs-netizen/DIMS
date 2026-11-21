@@ -1,5 +1,4 @@
-const API_BASE = '/api'
-
+const API_BASE = 'https://dims-5fam.onrender.com'
 async function request(path, options = {}) {
   const token = localStorage.getItem('dims_token')
   const headers = { 'Content-Type': 'application/json', ...options.headers }

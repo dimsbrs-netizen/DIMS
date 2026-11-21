@@ -73,7 +73,7 @@ if "department_id" not in _user_columns:
 if "must_change_password" not in _user_columns:
     with engine.begin() as _connection:
         _connection.execute(
-            text("ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT 0")
+            text("ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT FALSE")
         )
 
 # Consolidate legacy duplicate processed rows into one shared record per report.

@@ -1,27 +1,32 @@
+import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-# Local SQLite database
-DATABASE_URL = "sqlite:///./dims.db"
+# Local development defaults to SQLite. Deployment uses DATABASE_URL.
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./dims.db")
 
-# Create database engine
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False}
-)
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# Create database sessions
-SessionLocal = sessionmaker(
-    autocommit=False,
-    autoflush=False,
-    bind=engine
-)
+if DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgresql+"):
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=30,
+        pool_recycle=300,
+        connect_args={"sslmode": "require"},
+    )
+else:
+    engine = create_engine(
+        DATABASE_URL,
+        connect_args={"check_same_thread": False},
+    )
 
-# Base class for database models
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-
-# Database connection dependency
 def get_db():
     db = SessionLocal()
     try:
